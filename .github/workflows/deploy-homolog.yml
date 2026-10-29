@@ -2,6 +2,16 @@ name: Deploy Homolog/Dev Environment
 
 run-name: "Deploy ${{ github.ref_name == 'develop' && 'Dev' || github.ref_name == 'homolog' && 'Hml' || github.ref_name }} - ${{ inputs.api_selection }}"
 
+# Build once, deploy many: cada CONTEÚDO vira imagem uma vez só.
+#   - develop/homolog fazem build apenas de conteúdo novo (ex.: correção feita na release).
+#     Conteúdo que já tem imagem (ex.: develop mergeada na homolog, back-merge para a
+#     develop) só ganha a tag do ambiente, apontando para o mesmo digest.
+#   - todo deploy vira uma tag Git <serviço>/<env>-<sha> (ex.: webapi1/dev-abc1234). A
+#     detecção compara o conteúdo atual com o último deploy de dev e de hml.
+#   - prod nunca faz build: o promote-prod.yml promove o digest testado em homolog.
+# Mudança só de configuração (env/ConfigMap no Helm) não precisa deste workflow:
+# o ArgoCD sincroniza o values.yaml direto.
+
 on:
   workflow_dispatch:
     inputs:
@@ -56,8 +66,8 @@ jobs:
       existing_digest: ${{ steps.rebuild.outputs.existing_digest }}
       project_file: ${{ steps.build_vars.outputs.project_file }}
     steps:
-      # Histórico completo para recalcular o hash nos commits das imagens antigas
-      # (dev-<sha>/hml-<sha>). Tags Git não são mais necessárias.
+      # Histórico completo + tags: o hash é recalculado nos commits das tags de deploy
+      # (<serviço>/dev-<sha>, <serviço>/hml-<sha>).
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
@@ -96,35 +106,7 @@ jobs:
       - name: Setup deployment variables
         id: build_vars
         shell: bash
-        run: |
-          set -euo pipefail
-          SLUG="${{ env.PROJECT }}"
-
-          case "$SLUG" in
-            "WebApi1")
-              PROJ="WebApi1"; SVC="webapi1"; IMAGE_REPO="ci-test"
-              ;;
-            "WebApi2")
-              PROJ="WebApi2"; SVC="webapi2"; IMAGE_REPO="ci-test-2"
-              ;;
-            *)
-              echo "API não suportada: $SLUG"
-              exit 1
-              ;;
-          esac
-
-          DOTNET_PROJECT="${PROJ}"
-          PROJECT_FILE="./${DOTNET_PROJECT}/${DOTNET_PROJECT}.csproj"
-          DOCKERFILE_PATH="./docker-compose/dockerfiles/${PROJ}.Dockerfile"
-
-          # Só o nome do repo no Hub (sem o usuário). Incluir DOCKERHUB_USERNAME no
-          # job output faz o Actions descartar o valor ("may contain secret").
-          echo "dotnet_project=$DOTNET_PROJECT" >> "$GITHUB_OUTPUT"
-          echo "project_file=$PROJECT_FILE" >> "$GITHUB_OUTPUT"
-          echo "dockerfile_path=$DOCKERFILE_PATH" >> "$GITHUB_OUTPUT"
-          echo "image_name=$IMAGE_REPO" >> "$GITHUB_OUTPUT"
-          echo "image_slug=$SVC" >> "$GITHUB_OUTPUT"
-          echo "service_name=$SVC" >> "$GITHUB_OUTPUT"
+        run: bash .github/scripts/service-vars.sh "${{ env.PROJECT }}"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -136,17 +118,14 @@ jobs:
             --username "${{ secrets.DOCKERHUB_USERNAME }}" \
             --password-stdin
 
-      # Calcula o hash do conteúdo que entra na imagem e procura uma imagem dev-<sha>/hml-<sha>
-      # cujo commit tenha o mesmo hash (histórico + tags atuais do Helm).
-      # Achou -> needs_rebuild=false (só retag). Não achou -> build. Não cria tags.
+      # Calcula o hash do conteúdo que entra na imagem e compara com o último deploy de dev
+      # e de hml (tags Git <serviço>/dev-*, <serviço>/hml-*).
+      # Bateu -> needs_rebuild=false (só retag). Não bateu -> build. Não cria tags.
       - name: Detect if image rebuild is needed
         id: rebuild
         env:
           DOTNET_PROJECT: ${{ steps.build_vars.outputs.dotnet_project }}
           IMAGE_SLUG: ${{ steps.build_vars.outputs.image_slug }}
-          HELM_VALUES_FILES: >-
-            Helm/ci-test-dev/charts/${{ steps.build_vars.outputs.service_name }}/values.yaml
-            Helm/ci-test-hml/charts/${{ steps.build_vars.outputs.service_name }}/values.yaml
           REGISTRY_IMAGE_BASE: ${{ secrets.DOCKERHUB_USERNAME }}/${{ steps.build_vars.outputs.image_name }}
         shell: bash
         run: bash .github/scripts/services-need-rebuild.sh
@@ -235,6 +214,19 @@ jobs:
         shell: bash
         run: bash .github/scripts/gitops-bump-helm-image.sh
 
+      # Só depois do bump: a tag Git significa "este conteúdo está implantado no ambiente".
+      - name: Registrar deploy (tag Git)
+        env:
+          TAG_NAME: ${{ needs.prepare_build.outputs.service_name }}/${{ needs.prepare_build.outputs.env_tag }}
+          COMMIT: ${{ github.sha }}
+          IMAGE_NAME: ${{ needs.prepare_build.outputs.image_name }}
+          IMAGE_TAG: ${{ needs.prepare_build.outputs.env_tag }}
+          DIGEST: ${{ steps.digest.outputs.digest }}
+          CONTENT_HASH: ${{ needs.prepare_build.outputs.content_hash }}
+          SOURCE_TAG: ${{ needs.prepare_build.outputs.existing_tag }}
+        shell: bash
+        run: bash .github/scripts/git-deploy-tag.sh
+
       - name: Resumo
         env:
           ENV_TAG: ${{ needs.prepare_build.outputs.env_tag }}
@@ -244,6 +236,7 @@ jobs:
           HELM_DIR: ${{ needs.prepare_build.outputs.helm_dir }}
           REBUILD: ${{ needs.prepare_build.outputs.needs_rebuild }}
           REASON: ${{ needs.prepare_build.outputs.rebuild_reason }}
+          SERVICE: ${{ needs.prepare_build.outputs.service_name }}
         shell: bash
         run: |
           {
@@ -256,4 +249,5 @@ jobs:
             echo "| Tag do ambiente | \`${ENV_TAG}\` |"
             echo "| Digest | \`${DIGEST}\` |"
             echo "| Helm | \`${HELM_DIR}\` |"
+            echo "| Tag Git | \`${SERVICE}/${ENV_TAG}\` |"
           } >> "$GITHUB_STEP_SUMMARY"

@@ -1,30 +1,33 @@
 #!/usr/bin/env bash
 # Decide se o serviço precisa de build pelo CONTEÚDO que entra na imagem, e não por
-# branch, ambiente ou tag Git. As tags continuam no padrão dev-<sha7> / hml-<sha7>:
-# o hash de conteúdo não vira tag, só serve para achar uma imagem equivalente.
+# branch, ambiente ou tag Git. As tags de imagem continuam no padrão dev-<sha7> /
+# hml-<sha7>: o hash de conteúdo não vira tag, só serve para achar uma imagem equivalente.
 #
-# O hash é calculado sobre o conteúdo versionado (hash de árvore/blob do Git) de tudo
-# que entra no build do serviço:
-#   - <Projeto>/ (ex.: WebApi1/)
+# O hash é calculado sobre o conteúdo versionado (hash de blob do Git, arquivo a arquivo)
+# de tudo que entra no build do serviço:
+#   - <Projeto>/ (ex.: WebApi1/), menos o que está em IMAGE_EXCLUDES
 #   - docker-compose/dockerfiles/<Projeto>.Dockerfile
-#   - Libraries/<Lib>/ referenciadas pelo .csproj (diretas e transitivas)
+#   - Libraries/<Lib>/ referenciadas pelo .csproj (diretas e transitivas), menos IMAGE_EXCLUDES
 #   - arquivos de build da raiz (Directory.Build.*, Directory.Packages.props, NuGet.config,
 #     global.json) e o .image-rebuild (edite-o para forçar o rebuild de todos os serviços,
 #     ex.: patch da imagem base)
 #
-# Procura, nesta ordem, uma imagem dev-<sha7>/hml-<sha7> cujo commit tenha o mesmo hash:
-#   1. commits do histórico (first-parent) a partir de GIT_REF, enquanto o conteúdo do
-#      serviço for igual ao atual (até MAX_HISTORY commits)
-#   2. as tags que estão hoje no Helm de cada ambiente (HELM_VALUES_FILES), lidas da
-#      cópia local e da origin/develop. Cobre imagens de commits fora deste histórico,
-#      como a develop que andou depois do corte da release.
-# Achou -> needs_rebuild=false e o digest dela (o deploy só cria a tag do ambiente).
-# Não achou -> needs_rebuild=true.
+# Configuração de ambiente (appsettings*.json, launchSettings) não entra no hash nem na
+# imagem: vem do deploy (env/ConfigMap/Secret no Helm). Mudar config não gera build.
 #
-# Env obrigatório: DOTNET_PROJECT, IMAGE_SLUG, REGISTRY_IMAGE_BASE
-# Opcional: GIT_REF (padrão HEAD), HELM_VALUES_FILES (separados por espaço),
-#   MAX_HISTORY (padrão 50), GITHUB_OUTPUT (Actions)
-# Requer login prévio no registry e histórico do Git (checkout com fetch-depth: 0).
+# Cada deploy registra uma tag Git <serviço>/<tag-da-imagem> (ex.: webapi1/dev-abc1234),
+# criada pelo git-deploy-tag.sh. Este script compara o conteúdo atual com os últimos
+# DEPLOYS_PER_ENV deploys de CADA ambiente (dev e hml), não só do ambiente atual:
+#   - homolog depois do merge da develop -> bate com o último deploy de dev
+#   - develop depois do back-merge da release -> bate com o último deploy de hml
+#   - mudança só de config -> bate com o último deploy do próprio ambiente
+# Bateu -> confirma no registry que a imagem existe (uma consulta) e devolve o digest:
+#   needs_rebuild=false (o deploy só cria a tag do ambiente).
+# Não bateu (ou não há deploy anterior) -> needs_rebuild=true.
+#
+# Env obrigatório: DOTNET_PROJECT, IMAGE_SLUG (prefixo das tags Git), REGISTRY_IMAGE_BASE
+# Opcional: GIT_REF (padrão HEAD), DEPLOYS_PER_ENV (padrão 1), GITHUB_OUTPUT (Actions)
+# Requer login prévio no registry e as tags Git (checkout com fetch-depth: 0).
 # Não cria nenhuma tag.
 #
 # Saída (GITHUB_OUTPUT e stdout):
@@ -35,11 +38,11 @@ set -euo pipefail
 : "${IMAGE_SLUG:?IMAGE_SLUG é obrigatório}"
 : "${REGISTRY_IMAGE_BASE:?REGISTRY_IMAGE_BASE é obrigatório}"
 GIT_REF="${GIT_REF:-HEAD}"
-MAX_HISTORY="${MAX_HISTORY:-50}"
+DEPLOYS_PER_ENV="${DEPLOYS_PER_ENV:-1}"
 ENV_PREFIXES=(dev hml)
 
 # Mude a versão se alterar o algoritmo do hash.
-HASH_VERSION="content-hash-v1"
+HASH_VERSION="content-hash-v2"
 
 # Arquivos da raiz que afetam o build de todos os projetos. Podem não existir.
 ROOT_FILES=(
@@ -50,6 +53,17 @@ ROOT_FILES=(
   "nuget.config"
   "global.json"
   ".image-rebuild"
+)
+
+# Arquivos dentro do projeto/libs que NÃO entram na imagem. Mantenha em sincronia com o
+# .dockerignore: o que ele exclui do contexto não pode mudar o hash.
+IMAGE_EXCLUDES=(
+  "*/bin/*"
+  "*/obj/*"
+  "*/Properties/launchSettings.json"
+  "*/appsettings*.json"
+  "*.http"
+  "*/README.md"
 )
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -84,14 +98,30 @@ while IFS= read -r lib_path; do
   [[ -n "${lib_path}" ]] && LIBS+=("${lib_path}")
 done < <(dotnet_library_paths "${DOTNET_PROJECT}")
 
-# Lista "<caminho> <objeto git>" das entradas da imagem num commit, já ordenada.
+is_excluded() {
+  local file="$1" pattern
+  for pattern in "${IMAGE_EXCLUDES[@]}"; do
+    # shellcheck disable=SC2254
+    case "${file}" in ${pattern}) return 0 ;; esac
+  done
+  return 1
+}
+
+# Lista "<arquivo> <blob git>" das entradas da imagem num commit, já ordenada.
 # Retorna 1 (e imprime o caminho) se um caminho obrigatório não existir nesse commit.
 build_manifest() {
-  local ref="$1" p obj out="${HASH_VERSION}"$'\n'
+  local ref="$1" p obj file listing found out="${HASH_VERSION}"$'\n'
   for p in "${REQUIRED[@]}" "${LIBS[@]}"; do
-    obj="$(git rev-parse --verify -q "${ref}:${p}" 2>/dev/null || true)"
-    [[ -n "${obj}" ]] || { echo "${p}"; return 1; }
-    out+="${p} ${obj}"$'\n'
+    listing="$(git ls-tree -r --full-tree "${ref}" -- "${p}" 2>/dev/null || true)"
+    found=0
+    while IFS=$'\t' read -r meta file; do
+      [[ -n "${file}" ]] || continue
+      found=1
+      is_excluded "${file}" && continue
+      obj="${meta##* }"
+      out+="${file} ${obj}"$'\n'
+    done <<< "${listing}"
+    [[ "${found}" == "1" ]] || { echo "${p}"; return 1; }
   done
   for p in "${ROOT_FILES[@]}"; do
     obj="$(git rev-parse --verify -q "${ref}:${p}" 2>/dev/null || true)"
@@ -130,57 +160,36 @@ echo "Entradas da imagem de ${DOTNET_PROJECT} em ${GIT_REF}:"
 printf '  %s\n' "${manifest//$'\n'/$'\n'  }"
 echo "Hash de conteúdo: ${content_hash}"
 
-# Tenta reusar a imagem de uma tag; sai do script se ela tiver o mesmo conteúdo.
-declare -A TRIED=()
-try_tag() {
-  local tag="$1" commit="$2" source="$3" d
-  [[ -n "${TRIED[${tag}]:-}" ]] && return 0
-  TRIED["${tag}"]=1
-  [[ "$(hash_at "${commit}")" == "${content_hash}" ]] || return 0
-  d="$(registry_digest "${tag}")"
-  [[ -n "${d}" ]] || return 0
-  echo "Imagem ${tag} (${source}) tem o mesmo conteúdo: ${d}. Sem build."
-  emit "false" "content-exists:${tag}" "${content_hash}" "${tag}" "${d}"
-  exit 0
-}
-
-# 1. Histórico: commits com o mesmo conteúdo do serviço, do mais novo para o mais antigo.
-#    Para no primeiro commit em que o conteúdo muda.
+# Últimos deploys de cada ambiente, do mais novo para o mais antigo.
 checked=0
-while IFS= read -r commit; do
-  if [[ "$(hash_at "${commit}")" != "${content_hash}" ]]; then
-    break
-  fi
-  checked=$((checked + 1))
-  for prefix in "${ENV_PREFIXES[@]}"; do
-    try_tag "${prefix}-${commit:0:7}" "${commit}" "histórico"
-  done
-done < <(git rev-list --first-parent --max-count="${MAX_HISTORY}" "${head_commit}")
-echo "Histórico: ${checked} commit(s) com o mesmo conteúdo, nenhum com imagem dev/hml."
-
-# 2. Tags que estão hoje no Helm. Os bumps são mergeados na branch do deploy:
-#    o estado de dev vive na develop.
-helm_tag() {
-  sed -nE 's/^[[:space:]]*tag:[[:space:]]*["'\'']?([^"'\'' #]+)["'\'']?.*/\1/p' | head -n 1
-}
-helm_tags=()
-for values in ${HELM_VALUES_FILES:-}; do
-  if [[ -f "${values}" ]]; then
-    t="$(helm_tag < "${values}")"
-    [[ -n "${t}" ]] && helm_tags+=("${t}")
-  fi
-  t="$(git show "origin/develop:${values}" 2>/dev/null | helm_tag || true)"
-  [[ -n "${t}" ]] && helm_tags+=("${t}")
-done
-for tag in "${helm_tags[@]}"; do
-  [[ "${tag}" =~ ^(dev|hml)-([0-9a-f]{7})$ ]] || continue
-  commit="$(git rev-parse --verify -q "${BASH_REMATCH[2]}^{commit}" 2>/dev/null || true)"
-  if [[ -z "${commit}" ]]; then
-    echo "Helm ${tag}: commit não encontrado no histórico (ou SHA curto ambíguo), ignorando."
-    continue
-  fi
-  try_tag "${tag}" "${commit}" "Helm"
+for prefix in "${ENV_PREFIXES[@]}"; do
+  while IFS= read -r git_tag; do
+    [[ -n "${git_tag}" ]] || continue
+    image_tag="${git_tag#"${IMAGE_SLUG}/"}"
+    commit="$(git rev-parse --verify -q "refs/tags/${git_tag}^{commit}" 2>/dev/null || true)"
+    [[ -n "${commit}" ]] || continue
+    checked=$((checked + 1))
+    deployed_hash="$(hash_at "${commit}")"
+    if [[ "${deployed_hash}" != "${content_hash}" ]]; then
+      echo "Último deploy ${git_tag}: conteúdo ${deployed_hash:-desconhecido}, diferente."
+      continue
+    fi
+    d="$(registry_digest "${image_tag}")"
+    if [[ -z "${d}" ]]; then
+      echo "::warning::${git_tag} tem o mesmo conteúdo, mas a imagem ${image_tag} não está no registry."
+      continue
+    fi
+    echo "Último deploy ${git_tag} tem o mesmo conteúdo: ${d}. Sem build."
+    emit "false" "content-exists:${image_tag}" "${content_hash}" "${image_tag}" "${d}"
+    exit 0
+  done < <(git for-each-ref --sort=-creatordate --count="${DEPLOYS_PER_ENV}" \
+    --format='%(refname:strip=2)' "refs/tags/${IMAGE_SLUG}/${prefix}-*")
 done
 
-echo "Nenhuma imagem dev/hml com esse conteúdo. Build necessário."
+if ((checked == 0)); then
+  echo "Nenhum deploy anterior de ${IMAGE_SLUG} (tags ${IMAGE_SLUG}/dev-*, ${IMAGE_SLUG}/hml-*). Build necessário."
+  emit "true" "first-deploy" "${content_hash}" "" ""
+  exit 0
+fi
+echo "Conteúdo diferente dos últimos deploys de dev/hml. Build necessário."
 emit "true" "content-new" "${content_hash}" "" ""

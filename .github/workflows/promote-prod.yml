@@ -1,0 +1,201 @@
+name: Promote to Production
+
+run-name: "Promote Prd - ${{ inputs.api_selection }} ${{ inputs.version }}"
+
+# Build once, deploy many: prod NUNCA faz build. Promove o digest exato que foi testado
+# em homolog:
+#   hml-<sha> --(retag, sem build/pull)--> <versão>-<sha> --> bump Helm/ci-test-prd
+# O <sha> é o do commit que gerou a imagem, então a tag de prod aponta para a origem do
+# artefato.
+#
+# Versões são controladas por tags Git <serviço>/v<versão> (ex.: webapi1/v1.4.0), criadas
+# no commit do deploy de homolog. Uma versão que já tem tag não é promovida de novo,
+# sem consultar o registry.
+
+on:
+  workflow_dispatch:
+    inputs:
+      api_selection:
+        description: "Selecione a API"
+        required: true
+        type: choice
+        options:
+          - WebApi1
+          - WebApi2
+      version:
+        description: "Versão da release (ex.: 1.4.0)"
+        required: true
+        type: string
+      source_tag:
+        description: "Tag de homolog a promover (ex.: hml-abc1234). Vazio = último deploy de homolog (tag Git <serviço>/hml-*)."
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: write
+  pull-requests: write
+
+# Uma fila por API, sem cancelar no meio do merge do PR do Helm.
+concurrency:
+  group: deploy-prd-${{ inputs.api_selection }}
+  cancel-in-progress: false
+
+env:
+  PROJECT: ${{ inputs.api_selection }}
+  TARGET_BRANCH: main
+  HELM_DIR: Helm/ci-test-prd
+
+jobs:
+  promote:
+    name: Promote image and bump Helm
+    runs-on: ubuntu-latest
+    # Configure revisores obrigatórios em Settings > Environments > production.
+    environment: production
+    steps:
+      # Histórico completo + tags: as tags de deploy definem a origem e as versões.
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          ref: ${{ env.TARGET_BRANCH }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup deployment variables
+        id: build_vars
+        shell: bash
+        run: bash .github/scripts/service-vars.sh "${{ env.PROJECT }}"
+
+      - name: Resolve source and target tags
+        id: tags
+        env:
+          INPUT_TAG: ${{ inputs.source_tag }}
+          VERSION: ${{ inputs.version }}
+          SERVICE: ${{ steps.build_vars.outputs.service_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::version deve ser X.Y.Z (recebido: ${VERSION})."
+            exit 1
+          fi
+
+          version_tag="${SERVICE}/v${VERSION}"
+          if released="$(git rev-parse --verify -q "refs/tags/${version_tag}^{commit}")"; then
+            echo "::error::A versão ${VERSION} de ${SERVICE} já foi publicada (tag ${version_tag} em ${released::7}). Use outra versão."
+            exit 1
+          fi
+
+          tag="${INPUT_TAG}"
+          if [[ -z "${tag}" ]]; then
+            tag="$(git for-each-ref --sort=-creatordate --count=1 --format='%(refname:strip=2)' "refs/tags/${SERVICE}/hml-*")"
+            tag="${tag#"${SERVICE}/"}"
+            if [[ -z "${tag}" ]]; then
+              echo "::error::Nenhum deploy de homolog para ${SERVICE} (tag ${SERVICE}/hml-*). Informe source_tag."
+              exit 1
+            fi
+            echo "Último deploy de homolog: ${tag}"
+          fi
+          if [[ ! "${tag}" =~ ^hml-([0-9a-f]{7})$ ]]; then
+            echo "::error::source_tag deve ser hml-<sha7> (recebido: ${tag}). Só imagens testadas em homolog vão para prod."
+            exit 1
+          fi
+          short_sha="${BASH_REMATCH[1]}"
+
+          # A versão marca o commit que foi testado em homolog.
+          commit="$(git rev-parse --verify -q "refs/tags/${SERVICE}/${tag}^{commit}" 2>/dev/null \
+            || git rev-parse --verify -q "${short_sha}^{commit}" 2>/dev/null || true)"
+          if [[ -z "${commit}" ]]; then
+            echo "::error::Commit de ${tag} não encontrado (nem tag ${SERVICE}/${tag}, nem SHA ${short_sha})."
+            exit 1
+          fi
+          if ! git rev-parse --verify -q "refs/tags/${SERVICE}/${tag}" >/dev/null; then
+            echo "::warning::${tag} não tem tag Git de deploy em homolog. Confirme que é a versão testada."
+          fi
+
+          {
+            echo "source_tag=${tag}"
+            echo "target_tag=${VERSION}-${short_sha}"
+            echo "version_tag=${version_tag}"
+            echo "commit=${commit}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login on Docker Hub
+        shell: bash
+        run: |
+          echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login \
+            --username "${{ secrets.DOCKERHUB_USERNAME }}" \
+            --password-stdin
+
+      - name: Resolver digest da imagem de homolog
+        id: digest
+        env:
+          REGISTRY_IMAGE_BASE: ${{ secrets.DOCKERHUB_USERNAME }}/${{ steps.build_vars.outputs.image_name }}
+          SOURCE_TAG: ${{ steps.tags.outputs.source_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          digest="$(docker buildx imagetools inspect "${REGISTRY_IMAGE_BASE}:${SOURCE_TAG}" --format '{{.Manifest.Digest}}' 2>/dev/null || true)"
+          if [[ -z "${digest}" ]]; then
+            echo "::error::Imagem ${SOURCE_TAG} não existe no registry. Faça o deploy em homolog antes."
+            exit 1
+          fi
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+          echo "Digest de ${SOURCE_TAG}: ${digest}"
+
+      - name: Adicionar tag de produção (retag, sem build)
+        env:
+          REGISTRY_IMAGE_BASE: ${{ secrets.DOCKERHUB_USERNAME }}/${{ steps.build_vars.outputs.image_name }}
+          DIGEST: ${{ steps.digest.outputs.digest }}
+          TAG: ${{ steps.tags.outputs.target_tag }}
+        shell: bash
+        run: bash .github/scripts/retag.sh "${REGISTRY_IMAGE_BASE}" "${DIGEST}" "${TAG}"
+
+      - name: Bump Helm image tag for ArgoCD
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SERVICE: ${{ steps.build_vars.outputs.service_name }}
+          IMAGE_TAG: ${{ steps.tags.outputs.target_tag }}
+          ACTOR: ${{ github.triggering_actor }}
+          BRANCH: ${{ env.TARGET_BRANCH }}
+          VALUES_FILE: ${{ env.HELM_DIR }}/charts/${{ steps.build_vars.outputs.service_name }}/values.yaml
+          PR_BODY: |
+            Promove `${{ steps.build_vars.outputs.service_name }}` para produção: `${{ steps.tags.outputs.source_tag }}` → `${{ steps.tags.outputs.target_tag }}` (mesmo digest testado em homolog, sem build).
+
+            Branch protegida exige pull request, então o deploy abre este PR e faz o merge.
+        shell: bash
+        run: bash .github/scripts/gitops-bump-helm-image.sh
+
+      # Só depois do bump: a tag de versão significa "esta versão está em produção".
+      - name: Registrar versão (tag Git)
+        env:
+          TAG_NAME: ${{ steps.tags.outputs.version_tag }}
+          COMMIT: ${{ steps.tags.outputs.commit }}
+          IMAGE_NAME: ${{ steps.build_vars.outputs.image_name }}
+          IMAGE_TAG: ${{ steps.tags.outputs.target_tag }}
+          DIGEST: ${{ steps.digest.outputs.digest }}
+          SOURCE_TAG: ${{ steps.tags.outputs.source_tag }}
+        shell: bash
+        run: bash .github/scripts/git-deploy-tag.sh
+
+      - name: Resumo
+        env:
+          SOURCE_TAG: ${{ steps.tags.outputs.source_tag }}
+          TARGET_TAG: ${{ steps.tags.outputs.target_tag }}
+          DIGEST: ${{ steps.digest.outputs.digest }}
+          VERSION_TAG: ${{ steps.tags.outputs.version_tag }}
+        shell: bash
+        run: |
+          {
+            echo "### Promote ${TARGET_TAG}"
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Origem (homolog) | \`${SOURCE_TAG}\` |"
+            echo "| Tag de produção | \`${TARGET_TAG}\` |"
+            echo "| Digest | \`${DIGEST}\` |"
+            echo "| Helm | \`${HELM_DIR}\` |"
+            echo "| Tag Git | \`${VERSION_TAG}\` |"
+            echo "| Build | não (build once, deploy many) |"
+          } >> "$GITHUB_STEP_SUMMARY"

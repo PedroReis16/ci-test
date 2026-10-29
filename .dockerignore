@@ -8,3 +8,8 @@
 **/Dockerfile*
 **/.dockerignore
 **/README.md
+# Configuração de ambiente vem do deploy (Helm), nunca da imagem.
+# Mantenha em sincronia com IMAGE_EXCLUDES em .github/scripts/services-need-rebuild.sh.
+**/appsettings*.json
+**/Properties/launchSettings.json
+**/*.http
