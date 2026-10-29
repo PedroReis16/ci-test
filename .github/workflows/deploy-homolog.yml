@@ -1,0 +1,257 @@
+name: Deploy Homolog/Dev Environment
+
+run-name: "Deploy ${{ github.ref_name == 'develop' && 'Dev' || github.ref_name == 'homolog' && 'Hml' || github.ref_name }} - ${{ inputs.api_selection }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      api_selection:
+        description: "Selecione a API"
+        required: true
+        type: choice
+        options:
+          - WebApi1
+          - WebApi2
+
+permissions:
+  contents: write
+  pull-requests: write
+
+# Uma fila por branch + API: dev e hml da mesma API não se cancelam mais.
+# Sem cancel-in-progress, para não interromper um run no meio do merge do PR do Helm.
+concurrency:
+  group: deploy-${{ github.ref_name }}-${{ inputs.api_selection }}
+  cancel-in-progress: false
+
+env:
+  PROJECT: ${{ inputs.api_selection }}
+
+jobs:
+  # ─────────────────────────────────────────────
+  # 1. PREPARE BUILD ENVIRONMENT
+  # develop -> dev-<sha> + Helm/ci-test-dev
+  # homolog -> hml-<sha> + Helm/ci-test-hml
+  #
+  # Uma tag por run, sempre no padrão do ambiente (dev-<sha> / hml-<sha>):
+  #   - conteúdo novo     -> o build publica direto a tag do ambiente
+  #   - conteúdo existente -> retag de uma imagem dev/hml com o mesmo conteúdo
+  # ─────────────────────────────────────────────
+  prepare_build:
+    name: Prepare build environment
+    runs-on: ubuntu-latest
+    outputs:
+      env_prefix: ${{ steps.target.outputs.env_prefix }}
+      env_tag: ${{ steps.target.outputs.env_tag }}
+      helm_dir: ${{ steps.target.outputs.helm_dir }}
+      short_sha: ${{ steps.target.outputs.short_sha }}
+      dotnet_project: ${{ steps.build_vars.outputs.dotnet_project }}
+      service_name: ${{ steps.build_vars.outputs.service_name }}
+      dockerfile_path: ${{ steps.build_vars.outputs.dockerfile_path }}
+      image_name: ${{ steps.build_vars.outputs.image_name }}
+      image_slug: ${{ steps.build_vars.outputs.image_slug }}
+      needs_rebuild: ${{ steps.rebuild.outputs.needs_rebuild }}
+      rebuild_reason: ${{ steps.rebuild.outputs.reason }}
+      content_hash: ${{ steps.rebuild.outputs.content_hash }}
+      existing_tag: ${{ steps.rebuild.outputs.existing_tag }}
+      existing_digest: ${{ steps.rebuild.outputs.existing_digest }}
+      project_file: ${{ steps.build_vars.outputs.project_file }}
+    steps:
+      # Histórico completo para recalcular o hash nos commits das imagens antigas
+      # (dev-<sha>/hml-<sha>). Tags Git não são mais necessárias.
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Resolve target environment
+        id: target
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SHORT_SHA="${GITHUB_SHA::7}"
+          case "${GITHUB_REF_NAME}" in
+            develop)
+              ENV_PREFIX="dev"
+              HELM_DIR="Helm/ci-test-dev"
+              ;;
+            homolog)
+              ENV_PREFIX="hml"
+              HELM_DIR="Helm/ci-test-hml"
+              ;;
+            *)
+              echo "::error::Rode este workflow a partir de develop (dev) ou homolog (hml). Branch atual: ${GITHUB_REF_NAME}"
+              exit 1
+              ;;
+          esac
+
+          {
+            echo "env_prefix=${ENV_PREFIX}"
+            echo "env_tag=${ENV_PREFIX}-${SHORT_SHA}"
+            echo "helm_dir=${HELM_DIR}"
+            echo "short_sha=${SHORT_SHA}"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Ambiente: ${ENV_PREFIX} | tag: ${ENV_PREFIX}-${SHORT_SHA} | helm: ${HELM_DIR}"
+
+      - name: Setup deployment variables
+        id: build_vars
+        shell: bash
+        run: |
+          set -euo pipefail
+          SLUG="${{ env.PROJECT }}"
+
+          case "$SLUG" in
+            "WebApi1")
+              PROJ="WebApi1"; SVC="webapi1"; IMAGE_NAME="pedroreis16/ci-test"
+              ;;
+            "WebApi2")
+              PROJ="WebApi2"; SVC="webapi2"; IMAGE_NAME="pedroreis16/ci-test-2"
+              ;;
+            *)
+              echo "API não suportada: $SLUG"
+              exit 1
+              ;;
+          esac
+
+          DOTNET_PROJECT="${PROJ}"
+          PROJECT_FILE="./${DOTNET_PROJECT}/${DOTNET_PROJECT}.csproj"
+          DOCKERFILE_PATH="./docker-compose/dockerfiles/${PROJ}.Dockerfile"
+
+          echo "dotnet_project=$DOTNET_PROJECT" >> "$GITHUB_OUTPUT"
+          echo "project_file=$PROJECT_FILE" >> "$GITHUB_OUTPUT"
+          echo "dockerfile_path=$DOCKERFILE_PATH" >> "$GITHUB_OUTPUT"
+          echo "image_name=$IMAGE_NAME" >> "$GITHUB_OUTPUT"
+          echo "image_slug=$SVC" >> "$GITHUB_OUTPUT"
+          echo "service_name=$SVC" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login on Docker Hub
+        shell: bash
+        run: |
+          echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login \
+            --username "${{ secrets.DOCKERHUB_USERNAME }}" \
+            --password-stdin
+
+      # Calcula o hash do conteúdo que entra na imagem e procura uma imagem dev-<sha>/hml-<sha>
+      # cujo commit tenha o mesmo hash (histórico + tags atuais do Helm).
+      # Achou -> needs_rebuild=false (só retag). Não achou -> build. Não cria tags.
+      - name: Detect if image rebuild is needed
+        id: rebuild
+        env:
+          DOTNET_PROJECT: ${{ steps.build_vars.outputs.dotnet_project }}
+          IMAGE_SLUG: ${{ steps.build_vars.outputs.image_slug }}
+          HELM_VALUES_FILES: >-
+            Helm/ci-test-dev/charts/${{ steps.build_vars.outputs.service_name }}/values.yaml
+            Helm/ci-test-hml/charts/${{ steps.build_vars.outputs.service_name }}/values.yaml
+          REGISTRY_IMAGE_BASE: ${{ steps.build_vars.outputs.image_name }}
+        shell: bash
+        run: bash .github/scripts/services-need-rebuild.sh
+
+  # ─────────────────────────────────────────────
+  # 2. BUILD (dev-<sha> / hml-<sha>, só se esse conteúdo ainda não tem imagem)
+  # ─────────────────────────────────────────────
+  publish-project:
+    name: Build and publish image
+    needs: [prepare_build]
+    if: needs.prepare_build.outputs.needs_rebuild == 'true'
+    uses: ./.github/workflows/publish-project.yml
+    secrets: inherit
+    with:
+      dockerfile_path: ${{ needs.prepare_build.outputs.dockerfile_path }}
+      image_name: ${{ needs.prepare_build.outputs.image_name }}
+      image_tag: ${{ needs.prepare_build.outputs.env_tag }}
+      push_image: true
+
+  # ─────────────────────────────────────────────
+  # 3. RETAG + GITOPS (dev-<sha> ou hml-<sha>)
+  # ─────────────────────────────────────────────
+  retag_and_gitops:
+    name: Retag image and bump Helm
+    needs: [prepare_build, publish-project]
+    if: ${{ always() && needs.prepare_build.result == 'success' && (needs.publish-project.result == 'success' || needs.publish-project.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    env:
+      REGISTRY_IMAGE_BASE: ${{ needs.prepare_build.outputs.image_name }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          ref: ${{ github.ref_name }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login on Docker Hub
+        shell: bash
+        run: |
+          echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login \
+            --username "${{ secrets.DOCKERHUB_USERNAME }}" \
+            --password-stdin
+
+      # Digest do build novo ou, se o build foi pulado, o da imagem com o mesmo conteúdo.
+      - name: Resolver digest da imagem
+        id: digest
+        env:
+          PUBLISHED_DIGEST: ${{ needs.publish-project.outputs.digest }}
+          EXISTING_DIGEST: ${{ needs.prepare_build.outputs.existing_digest }}
+          EXISTING_TAG: ${{ needs.prepare_build.outputs.existing_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          digest="${PUBLISHED_DIGEST:-${EXISTING_DIGEST}}"
+          if [[ -z "${digest}" ]]; then
+            echo "::error::Sem digest (nem do build, nem de imagem existente)."
+            exit 1
+          fi
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+          echo "Digest: ${digest} (origem: ${EXISTING_TAG:-build novo})"
+
+      # Se o build deste run já publicou a tag do ambiente, o retag.sh não faz nada.
+      - name: Adicionar tag do ambiente (retag, sem build)
+        env:
+          DIGEST: ${{ steps.digest.outputs.digest }}
+          TAG: ${{ needs.prepare_build.outputs.env_tag }}
+        shell: bash
+        run: bash .github/scripts/retag.sh "${REGISTRY_IMAGE_BASE}" "${DIGEST}" "${TAG}"
+
+      - name: Bump Helm image tag for ArgoCD
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SERVICE: ${{ needs.prepare_build.outputs.service_name }}
+          IMAGE_TAG: ${{ needs.prepare_build.outputs.env_tag }}
+          ACTOR: ${{ github.triggering_actor }}
+          BRANCH: ${{ github.ref_name }}
+          VALUES_FILE: ${{ needs.prepare_build.outputs.helm_dir }}/charts/${{ needs.prepare_build.outputs.service_name }}/values.yaml
+          PR_BODY: |
+            Atualiza `image.tag` de `${{ needs.prepare_build.outputs.service_name }}` para `${{ needs.prepare_build.outputs.env_tag }}`.
+
+            Branch protegida exige pull request, então o deploy abre este PR e faz o merge.
+        shell: bash
+        run: bash .github/scripts/gitops-bump-helm-image.sh
+
+      - name: Resumo
+        env:
+          ENV_TAG: ${{ needs.prepare_build.outputs.env_tag }}
+          EXISTING_TAG: ${{ needs.prepare_build.outputs.existing_tag }}
+          CONTENT_HASH: ${{ needs.prepare_build.outputs.content_hash }}
+          DIGEST: ${{ steps.digest.outputs.digest }}
+          HELM_DIR: ${{ needs.prepare_build.outputs.helm_dir }}
+          REBUILD: ${{ needs.prepare_build.outputs.needs_rebuild }}
+          REASON: ${{ needs.prepare_build.outputs.rebuild_reason }}
+        shell: bash
+        run: |
+          {
+            echo "### Deploy ${ENV_TAG}"
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Rebuild | \`${REBUILD}\` (\`${REASON}\`) |"
+            echo "| Hash de conteúdo | \`${CONTENT_HASH}\` |"
+            echo "| Reusada de | \`${EXISTING_TAG:-(build novo)}\` |"
+            echo "| Tag do ambiente | \`${ENV_TAG}\` |"
+            echo "| Digest | \`${DIGEST}\` |"
+            echo "| Helm | \`${HELM_DIR}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"

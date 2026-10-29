@@ -1,0 +1,250 @@
+name: Deploy project image
+
+on:
+  workflow_call:
+    inputs:
+      dockerfile_path:
+        type: string
+        required: true
+      image_name:
+        type: string
+        required: true
+      image_tag:
+        description: Tag do ambiente a publicar (ex. dev-abc1234 ou hml-abc1234). É a única tag criada no build.
+        type: string
+        required: true
+      push_image:
+        type: boolean
+        required: false
+        default: true
+    outputs:
+      digest:
+        description: Image digest in the registry
+        value: ${{ jobs.publish-docker-image.outputs.digest }}
+      short_sha:
+        description: 7-character commit SHA used in image tags
+        value: ${{ jobs.publish-docker-image.outputs.short_sha }}
+      image_tag:
+        description: Tag published or reused for this environment
+        value: ${{ jobs.publish-docker-image.outputs.image_tag }}
+
+jobs:
+  publish-docker-image:
+    name: Build and publish image
+    runs-on: ubuntu-latest
+    outputs:
+      digest: ${{ steps.digest.outputs.digest }}
+      short_sha: ${{ steps.image_meta.outputs.short_sha }}
+      image_tag: ${{ steps.image_meta.outputs.image_tag }}
+    env:
+      DOCKERFILE_PATH: ${{ inputs.dockerfile_path }}
+      REGISTRY_IMAGE_BASE: ${{ inputs.image_name }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Resolve image tags
+        id: image_meta
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SHORT_SHA="${GITHUB_SHA::7}"
+          IMAGE_TAG="${{ inputs.image_tag }}"
+
+          {
+            echo "short_sha=${SHORT_SHA}"
+            echo "image_tag=${IMAGE_TAG}"
+            echo "registry_image=${REGISTRY_IMAGE_BASE}:${IMAGE_TAG}"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Build configuration: Release"
+          echo "Image tag: ${IMAGE_TAG}"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login on Docker Hub
+        if: inputs.push_image
+        shell: bash
+        run: |
+          echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login \
+            --username "${{ secrets.DOCKERHUB_USERNAME }}" \
+            --password-stdin
+
+      # O prepare já decidiu que este conteúdo não tem imagem. Esta checagem só cobre
+      # um re-run do mesmo commit que já tenha publicado a tag.
+      - name: Tag já existe?
+        id: exists
+        if: inputs.push_image
+        env:
+          IMAGE_TAG: ${{ steps.image_meta.outputs.image_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          digest=$(docker buildx imagetools inspect "${REGISTRY_IMAGE_BASE}:${IMAGE_TAG}" --format '{{.Manifest.Digest}}' 2>/dev/null || true)
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+          if [[ -n "${digest}" ]]; then
+            echo "Imagem ${IMAGE_TAG} já existe (${digest}). Build será pulado."
+          fi
+
+      - name: Set up QEMU
+        if: steps.exists.outputs.digest == ''
+        uses: docker/setup-qemu-action@v3
+
+      - name: Build image locally for security validation
+        id: build
+        if: steps.exists.outputs.digest == ''
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ env.DOCKERFILE_PATH }}
+          load: true
+          platforms: linux/amd64
+          build-args: |
+            BUILD_CONFIGURATION=Release
+          tags: |
+            ${{ env.REGISTRY_IMAGE_BASE }}:${{ steps.image_meta.outputs.image_tag }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+          provenance: false
+          sbom: false
+
+      # - name: Generate Trivy image report
+      #   if: steps.exists.outputs.digest == ''
+      #   uses: aquasecurity/trivy-action@0.35.0
+      #   env:
+      #     TRIVY_DB_REPOSITORY: mirror.gcr.io/aquasec/trivy-db:2,public.ecr.aws/aquasecurity/trivy-db:2,ghcr.io/aquasec/trivy-db:2
+      #     TRIVY_JAVA_DB_REPOSITORY: mirror.gcr.io/aquasec/trivy-java-db:1,public.ecr.aws/aquasecurity/trivy-java-db:1,ghcr.io/aquasec/trivy-java-db:1
+      #   with:
+      #     image-ref: ${{ steps.image_meta.outputs.registry_image }}
+      #     scanners: vuln,secret
+      #     severity: HIGH,CRITICAL
+      #     ignore-unfixed: true
+      #     exit-code: "0"
+      #     format: json
+      #     output: trivy-image-results.json
+
+      # - name: Annotate Trivy image findings
+      #   if: steps.exists.outputs.digest == ''
+      #   shell: bash
+      #   env:
+      #     REGISTRY_IMAGE: ${{ steps.image_meta.outputs.registry_image }}
+      #   run: |
+      #     python3 <<'PY'
+      #     import json
+      #     import os
+      #     import pathlib
+      #     import sys
+      #
+      #     report_path = pathlib.Path("trivy-image-results.json")
+      #     if not report_path.exists():
+      #         print("::warning::Trivy report file not found: trivy-image-results.json")
+      #         sys.exit(0)
+      #
+      #     data = json.loads(report_path.read_text(encoding="utf-8"))
+      #     findings = 0
+      #     default_target = os.environ.get("REGISTRY_IMAGE", "image")
+      #
+      #     for result in data.get("Results", []):
+      #         target = result.get("Target", default_target)
+      #
+      #         for vuln in result.get("Vulnerabilities", []) or []:
+      #             severity = (vuln.get("Severity") or "UNKNOWN").upper()
+      #             pkg = vuln.get("PkgName") or "unknown-package"
+      #             title = vuln.get("Title") or vuln.get("VulnerabilityID") or "Vulnerability found"
+      #             installed = vuln.get("InstalledVersion") or "unknown"
+      #             fixed = vuln.get("FixedVersion") or "unfixed"
+      #             message = (
+      #                 f"[Trivy Image][{severity}] {title} | package={pkg} | "
+      #                 f"installed={installed} | fixed={fixed} | target={target}"
+      #             )
+      #             print(f"::error title=Trivy image vulnerability::{message}")
+      #             findings += 1
+      #
+      #         for secret in result.get("Secrets", []) or []:
+      #             severity = (secret.get("Severity") or "UNKNOWN").upper()
+      #             title = secret.get("Title") or secret.get("RuleID") or "Secret found"
+      #             match = secret.get("Match") or ""
+      #             category = secret.get("Category") or "secret"
+      #             location = secret.get("StartLine")
+      #             message = f"[Trivy Image][{severity}] {title} | category={category} | target={target}"
+      #             if match:
+      #                 message += f" | match={match}"
+      #
+      #             annotation = "::error"
+      #             if isinstance(location, int) and location > 0:
+      #                 annotation += f" line={location}"
+      #             annotation += f" title=Trivy image secret::{message}"
+      #             print(annotation)
+      #             findings += 1
+      #
+      #     print(f"Trivy image annotations emitted: {findings}.")
+      #     PY
+      #
+      # - name: Enforce Trivy image findings
+      #   if: steps.exists.outputs.digest == ''
+      #   shell: bash
+      #   run: |
+      #     python3 <<'PY'
+      #     import json
+      #     import pathlib
+      #     import sys
+      #
+      #     report_path = pathlib.Path("trivy-image-results.json")
+      #     if not report_path.exists():
+      #         print("::error::Trivy image report file not found: trivy-image-results.json")
+      #         sys.exit(1)
+      #
+      #     data = json.loads(report_path.read_text(encoding="utf-8"))
+      #     findings = 0
+      #
+      #     for result in data.get("Results", []):
+      #         findings += len(result.get("Vulnerabilities", []) or [])
+      #         findings += len(result.get("Secrets", []) or [])
+      #
+      #     if findings > 0:
+      #         print(f"::error::Trivy encontrou {findings} achado(s) HIGH/CRITICAL no scan da imagem Docker.")
+      #         sys.exit(1)
+      #
+      #     print("Trivy image scan concluído sem achados HIGH/CRITICAL.")
+      #     PY
+
+      - name: Push Docker image
+        if: inputs.push_image && steps.exists.outputs.digest == ''
+        shell: bash
+        env:
+          IMAGE_TAG: ${{ steps.image_meta.outputs.image_tag }}
+        run: |
+          set -euo pipefail
+          if docker push "${REGISTRY_IMAGE_BASE}:${IMAGE_TAG}"; then
+            exit 0
+          fi
+          # Com o repositório imutável, o push falha se a tag já foi publicada (ex.: re-run).
+          # É o mesmo commit, então reusa a imagem que já está lá.
+          existing=$(docker buildx imagetools inspect "${REGISTRY_IMAGE_BASE}:${IMAGE_TAG}" --format '{{.Manifest.Digest}}' 2>/dev/null || true)
+          if [[ -n "${existing}" ]]; then
+            echo "::warning::${IMAGE_TAG} foi publicada por outra execução (${existing}). Reusando."
+            exit 0
+          fi
+          exit 1
+
+      - name: Digest final
+        id: digest
+        shell: bash
+        env:
+          IMAGE_TAG: ${{ steps.image_meta.outputs.image_tag }}
+          EXISTING_DIGEST: ${{ steps.exists.outputs.digest }}
+        run: |
+          set -euo pipefail
+          digest="${EXISTING_DIGEST}"
+          if [[ -z "${digest}" ]]; then
+            digest=$(docker buildx imagetools inspect "${REGISTRY_IMAGE_BASE}:${IMAGE_TAG}" --format '{{.Manifest.Digest}}')
+          fi
+          if [[ -z "${digest}" ]]; then
+            echo "::error::Não foi possível obter o digest de ${REGISTRY_IMAGE_BASE}:${IMAGE_TAG}"
+            exit 1
+          fi
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+          echo "Digest: ${digest}"
