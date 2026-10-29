@@ -5,7 +5,7 @@
 # image.tag é atualizado pela pipeline — não edite à mão.
 image:
   repository: pedroreis16/ci-test
-  tag: "initial"
+  tag: "dev-d81fefe"
   pullPolicy: Always
 
 # Configuração do ambiente (antes no appsettings). Mudar aqui não gera build:
