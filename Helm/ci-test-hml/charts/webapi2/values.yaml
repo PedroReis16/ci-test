@@ -1,0 +1,16 @@
+# Simulação dos values do chart de webapi2 em hml. Não é um chart Helm real: só o
+# arquivo que a pipeline altera (image.tag/pullPolicy via bump-helm-image.py) e que o
+# ArgoCD sincronizaria.
+#
+# image.tag é atualizado pela pipeline — não edite à mão.
+image:
+  repository: pedroreis16/ci-test-2
+  tag: "initial"
+  pullPolicy: Always
+
+# Configuração do ambiente (antes no appsettings). Mudar aqui não gera build:
+# Helm/ fica fora do hash de conteúdo da imagem.
+env:
+  ASPNETCORE_ENVIRONMENT: Staging
+  Logging__LogLevel__Default: Information
+  Logging__LogLevel__Microsoft.AspNetCore: Warning
