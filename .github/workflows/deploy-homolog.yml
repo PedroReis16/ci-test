@@ -102,10 +102,10 @@ jobs:
 
           case "$SLUG" in
             "WebApi1")
-              PROJ="WebApi1"; SVC="webapi1"; IMAGE_NAME="pedroreis16/ci-test"
+              PROJ="WebApi1"; SVC="webapi1"; IMAGE_REPO="ci-test"
               ;;
             "WebApi2")
-              PROJ="WebApi2"; SVC="webapi2"; IMAGE_NAME="pedroreis16/ci-test-2"
+              PROJ="WebApi2"; SVC="webapi2"; IMAGE_REPO="ci-test-2"
               ;;
             *)
               echo "API não suportada: $SLUG"
@@ -117,10 +117,12 @@ jobs:
           PROJECT_FILE="./${DOTNET_PROJECT}/${DOTNET_PROJECT}.csproj"
           DOCKERFILE_PATH="./docker-compose/dockerfiles/${PROJ}.Dockerfile"
 
+          # Só o nome do repo no Hub (sem o usuário). Incluir DOCKERHUB_USERNAME no
+          # job output faz o Actions descartar o valor ("may contain secret").
           echo "dotnet_project=$DOTNET_PROJECT" >> "$GITHUB_OUTPUT"
           echo "project_file=$PROJECT_FILE" >> "$GITHUB_OUTPUT"
           echo "dockerfile_path=$DOCKERFILE_PATH" >> "$GITHUB_OUTPUT"
-          echo "image_name=$IMAGE_NAME" >> "$GITHUB_OUTPUT"
+          echo "image_name=$IMAGE_REPO" >> "$GITHUB_OUTPUT"
           echo "image_slug=$SVC" >> "$GITHUB_OUTPUT"
           echo "service_name=$SVC" >> "$GITHUB_OUTPUT"
 
@@ -145,7 +147,7 @@ jobs:
           HELM_VALUES_FILES: >-
             Helm/ci-test-dev/charts/${{ steps.build_vars.outputs.service_name }}/values.yaml
             Helm/ci-test-hml/charts/${{ steps.build_vars.outputs.service_name }}/values.yaml
-          REGISTRY_IMAGE_BASE: ${{ steps.build_vars.outputs.image_name }}
+          REGISTRY_IMAGE_BASE: ${{ secrets.DOCKERHUB_USERNAME }}/${{ steps.build_vars.outputs.image_name }}
         shell: bash
         run: bash .github/scripts/services-need-rebuild.sh
 
@@ -173,7 +175,7 @@ jobs:
     if: ${{ always() && needs.prepare_build.result == 'success' && (needs.publish-project.result == 'success' || needs.publish-project.result == 'skipped') }}
     runs-on: ubuntu-latest
     env:
-      REGISTRY_IMAGE_BASE: ${{ needs.prepare_build.outputs.image_name }}
+      REGISTRY_IMAGE_BASE: ${{ secrets.DOCKERHUB_USERNAME }}/${{ needs.prepare_build.outputs.image_name }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
